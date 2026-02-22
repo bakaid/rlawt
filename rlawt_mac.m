@@ -109,9 +109,41 @@ static void propsPutInt(CFMutableDictionaryRef props, const CFStringRef key, int
 	CFRelease(boxedValue);
 }
 
-static bool rlawtCreateIOSurface(JNIEnv *env, AWTContext *ctx) {
-	CGFloat scale = ctx->layer.superlayer.contentsScale;
-	CGSize size = ctx->layer.frame.size;
+// -- IOSurfacePool helpers --
+
+static void poolInit(IOSurfacePool *pool) {
+	memset(pool, 0, sizeof(*pool));
+	GLuint textures[RLAWT_MAX_POOL], framebuffers[RLAWT_MAX_POOL];
+	glGenTextures(RLAWT_MAX_POOL, textures);
+	glGenFramebuffers(RLAWT_MAX_POOL, framebuffers);
+	for (int i = 0; i < RLAWT_MAX_POOL; i++) {
+		pool->entries[i].tex = textures[i];
+		pool->entries[i].fbo = framebuffers[i];
+	}
+}
+
+static void poolDestroy(IOSurfacePool *pool) {
+	for (int i = 0; i < RLAWT_MAX_POOL; i++) {
+		glDeleteTextures(1, &pool->entries[i].tex);
+		glDeleteFramebuffers(1, &pool->entries[i].fbo);
+		if (pool->entries[i].surface) {
+			CFRelease(pool->entries[i].surface);
+		}
+	}
+}
+
+static bool poolEntryMatchesSize(IOSurfaceEntry *entry, CALayer *layer) {
+	if (!entry->surface) return false;
+	CGFloat scale = entry->scale;
+	CGSize size = layer.frame.size;
+	return IOSurfaceGetWidth(entry->surface) == (size_t)(size.width * scale)
+		&& IOSurfaceGetHeight(entry->surface) == (size_t)(size.height * scale)
+		&& layer.superlayer.contentsScale == scale;
+}
+
+static bool poolCreateSurface(JNIEnv *env, IOSurfaceEntry *entry, CALayer *layer, CGLContextObj cglCtx) {
+	CGFloat scale = layer.superlayer.contentsScale;
+	CGSize size = layer.frame.size;
 	size.width *= scale;
 	size.height *= scale;
 
@@ -127,20 +159,20 @@ static bool rlawtCreateIOSurface(JNIEnv *env, AWTContext *ctx) {
 		rlawtThrow(env, "unable to create io surface");
 		return false;
 	}
-	
+
 	const GLuint target = GL_TEXTURE_RECTANGLE;
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(target, ctx->tex[ctx->back]);
+	glBindTexture(target, entry->tex);
 	CGLError err = CGLTexImageIOSurface2D(
-		ctx->context,
+		cglCtx,
 		target, GL_RGBA,
 		size.width, size.height,
 		GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
-		buf, 
+		buf,
 		0);
 	glBindTexture(target, 0);
-	glBindFramebuffer(GL_FRAMEBUFFER, ctx->fbo[ctx->back]);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, ctx->tex[ctx->back], 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, entry->fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, entry->tex, 0);
 
 	if (err != kCGLNoError) {
 		rlawtThrowCGLError(env, "unable to bind io surface to texture", err);
@@ -155,15 +187,37 @@ static bool rlawtCreateIOSurface(JNIEnv *env, AWTContext *ctx) {
 		goto freeSurface;
 	}
 
-	if (ctx->buffer[ctx->back]) {
-		CFRelease(ctx->buffer[ctx->back]);
+	if (entry->surface) {
+		CFRelease(entry->surface);
 	}
-	ctx->buffer[ctx->back] = buf;
-	ctx->bufferScale[ctx->back] = scale;
+	entry->surface = buf;
+	entry->scale = scale;
 	return true;
 freeSurface:
 	CFRelease(buf);
 	return false;
+}
+
+static int poolNextBack(IOSurfacePool *pool) {
+	// Find any non-front surface the compositor isn't using
+	for (int i = 0; i < pool->count; i++) {
+		if (i == pool->front) continue;
+		if (pool->entries[i].surface && !IOSurfaceIsInUse(pool->entries[i].surface)) {
+			return i;
+		}
+	}
+
+	// Grow pool if nothing was available
+	if (pool->count < RLAWT_MAX_POOL) {
+		return pool->count++;
+	}
+
+	// Pool full, all in use -- evict first non-front entry.
+	// count >= 2 is guaranteed here (pool grows on first swap), so this always finds one.
+	for (int i = 0; i < pool->count; i++) {
+		if (i != pool->front) return i;
+	}
+	return 0; // unreachable
 }
 
 JNIEXPORT void JNICALL Java_net_runelite_rlawt_AWTContext_createGLContext(JNIEnv *env, jobject self) {
@@ -215,8 +269,7 @@ JNIEXPORT void JNICALL Java_net_runelite_rlawt_AWTContext_createGLContext(JNIEnv
 		goto freeContext;
 	}
 
-	glGenTextures(2, &ctx->tex[0]);
-	glGenFramebuffers(2, &ctx->fbo[0]);
+	poolInit(&ctx->pool);
 
 	dispatch_sync(dispatch_get_main_queue(), ^{
 		RLLayer *layer = [[RLLayer alloc] init];
@@ -237,7 +290,8 @@ JNIEXPORT void JNICALL Java_net_runelite_rlawt_AWTContext_createGLContext(JNIEnv
 			dsi->bounds.height);
 	});
 
-	if (!rlawtCreateIOSurface(env, ctx)) {
+	ctx->pool.count = 1;
+	if (!poolCreateSurface(env, &ctx->pool.entries[0], ctx->layer, ctx->context)) {
 		goto freeContext;
 	}
 
@@ -253,15 +307,10 @@ freeDSI:
 }
 
 void rlawtContextFreePlatform(JNIEnv *env, AWTContext *ctx) {
+	poolDestroy(&ctx->pool);
 	CGLSetCurrentContext(NULL);
 	if (ctx->context) {
 		CGLDestroyContext(ctx->context);
-	}
-	if (ctx->buffer[0]) {
-		CFRelease(ctx->buffer[0]);
-	}
-	if (ctx->buffer[1]) {
-		CFRelease(ctx->buffer[1]);
 	}
 	if (ctx->layer) {
 		dispatch_sync(dispatch_get_main_queue(), ^{
@@ -300,20 +349,26 @@ JNIEXPORT void JNICALL Java_net_runelite_rlawt_AWTContext_swapBuffers(JNIEnv *en
 	}
 
 	glFlush();
+
+	IOSurfacePool *pool = &ctx->pool;
+
+	// Present the current back buffer
+	pool->front = pool->back;
 	RLLayer *rlLayer = (RLLayer*) ctx->layer;
-	rlLayer->newScale = ctx->bufferScale[ctx->back];
+	rlLayer->newScale = pool->entries[pool->front].scale;
 	[rlLayer performSelectorOnMainThread:
 		@selector(displayIOSurface:)
-		withObject: (id)(ctx->buffer[ctx->back])
+		withObject: (id)(pool->entries[pool->front].surface)
 		waitUntilDone: true];
-	
-	ctx->back ^= 1;
 
-	if (!ctx->buffer[ctx->back]
-		|| IOSurfaceGetWidth(ctx->buffer[ctx->back]) != (size_t) (ctx->layer.frame.size.width * ctx->bufferScale[ctx->back])
-		|| IOSurfaceGetHeight(ctx->buffer[ctx->back]) != (size_t) (ctx->layer.frame.size.height * ctx->bufferScale[ctx->back])
-		|| ctx->layer.superlayer.contentsScale != ctx->bufferScale[ctx->back]) {
-		if (!rlawtCreateIOSurface(env, ctx)) {
+	// Find a free surface for the next frame
+	pool->back = poolNextBack(pool);
+	IOSurfaceEntry *back = &pool->entries[pool->back];
+
+	// Create/recreate surface if needed (new slot, wrong size, or still held by compositor)
+	if (!poolEntryMatchesSize(back, ctx->layer)
+		|| IOSurfaceIsInUse(back->surface)) {
+		if (!poolCreateSurface(env, back, ctx->layer, ctx->context)) {
 			return;
 		}
 	}
@@ -325,7 +380,10 @@ JNIEXPORT jint JNICALL Java_net_runelite_rlawt_AWTContext_getFramebuffer(JNIEnv 
 		return 0;
 	}
 
-	return ctx->fbo[ctx->back ^ front];
+	if (front) {
+		return ctx->pool.entries[ctx->pool.front].fbo;
+	}
+	return ctx->pool.entries[ctx->pool.back].fbo;
 }
 
 #endif
