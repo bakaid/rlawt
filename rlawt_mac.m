@@ -111,6 +111,12 @@ static void propsPutInt(CFMutableDictionaryRef props, const CFStringRef key, int
 
 // -- IOSurfacePool helpers --
 
+#ifdef RLAWT_POOL_DEBUG
+#define POOL_STAT(pool, field) ((pool)->stats.field++)
+#else
+#define POOL_STAT(pool, field) ((void)0)
+#endif
+
 static void poolInit(IOSurfacePool *pool) {
 	memset(pool, 0, sizeof(*pool));
 	GLuint textures[RLAWT_MAX_POOL], framebuffers[RLAWT_MAX_POOL];
@@ -120,6 +126,9 @@ static void poolInit(IOSurfacePool *pool) {
 		pool->entries[i].tex = textures[i];
 		pool->entries[i].fbo = framebuffers[i];
 	}
+#ifdef RLAWT_POOL_DEBUG
+	pool->lastLogTime = CFAbsoluteTimeGetCurrent();
+#endif
 }
 
 static void poolDestroy(IOSurfacePool *pool) {
@@ -203,22 +212,55 @@ static int poolNextBack(IOSurfacePool *pool) {
 	for (int i = 0; i < pool->count; i++) {
 		if (i == pool->front) continue;
 		if (pool->entries[i].surface && !IOSurfaceIsInUse(pool->entries[i].surface)) {
+			POOL_STAT(pool, reuses);
 			return i;
 		}
 	}
 
 	// Grow pool if nothing was available
 	if (pool->count < RLAWT_MAX_POOL) {
-		return pool->count++;
+		int idx = pool->count++;
+		POOL_STAT(pool, grows);
+#ifdef RLAWT_POOL_DEBUG
+		if (pool->count > pool->stats.highWater) {
+			pool->stats.highWater = pool->count;
+		}
+#endif
+		return idx;
 	}
 
 	// Pool full, all in use -- evict first non-front entry.
 	// count >= 2 is guaranteed here (pool grows on first swap), so this always finds one.
 	for (int i = 0; i < pool->count; i++) {
-		if (i != pool->front) return i;
+		if (i != pool->front) {
+			POOL_STAT(pool, stalls);
+			return i;
+		}
 	}
 	return 0; // unreachable
 }
+
+#ifdef RLAWT_POOL_DEBUG
+static void poolLogStats(IOSurfacePool *pool) {
+	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	if (now - pool->lastLogTime < 60.0) return;
+
+	NSLog(@"IOSurfacePool: %d swaps, %d allocs, pool %d/%d (hw %d), %d reuse, %d grow, %d stall, %d fail",
+		pool->stats.swaps,
+		pool->stats.allocs,
+		pool->count,
+		RLAWT_MAX_POOL,
+		pool->stats.highWater,
+		pool->stats.reuses,
+		pool->stats.grows,
+		pool->stats.stalls,
+		pool->stats.failures);
+
+	memset(&pool->stats, 0, sizeof(pool->stats));
+	pool->stats.highWater = pool->count;
+	pool->lastLogTime = now;
+}
+#endif
 
 JNIEXPORT void JNICALL Java_net_runelite_rlawt_AWTContext_createGLContext(JNIEnv *env, jobject self) {
 	AWTContext *ctx = rlawtGetContext(env, self);
@@ -361,6 +403,8 @@ JNIEXPORT void JNICALL Java_net_runelite_rlawt_AWTContext_swapBuffers(JNIEnv *en
 		withObject: (id)(pool->entries[pool->front].surface)
 		waitUntilDone: true];
 
+	POOL_STAT(pool, swaps);
+
 	// Find a free surface for the next frame
 	pool->back = poolNextBack(pool);
 	IOSurfaceEntry *back = &pool->entries[pool->back];
@@ -369,9 +413,15 @@ JNIEXPORT void JNICALL Java_net_runelite_rlawt_AWTContext_swapBuffers(JNIEnv *en
 	if (!poolEntryMatchesSize(back, ctx->layer)
 		|| IOSurfaceIsInUse(back->surface)) {
 		if (!poolCreateSurface(env, back, ctx->layer, ctx->context)) {
+			POOL_STAT(pool, failures);
 			return;
 		}
+		POOL_STAT(pool, allocs);
 	}
+
+#ifdef RLAWT_POOL_DEBUG
+	poolLogStats(pool);
+#endif
 }
 
 JNIEXPORT jint JNICALL Java_net_runelite_rlawt_AWTContext_getFramebuffer(JNIEnv *env, jobject self, jboolean front) {

@@ -61,6 +61,19 @@ typedef struct {
 	int count; // entries currently allocated (0..RLAWT_MAX_POOL)
 	int back;  // current render target index
 	int front; // most recently presented surface index
+
+#ifdef RLAWT_POOL_DEBUG
+	struct {
+		int swaps;
+		int allocs;
+		int reuses;
+		int grows;
+		int stalls;
+		int failures;
+		int highWater;
+	} stats;
+	CFAbsoluteTime lastLogTime;
+#endif
 } IOSurfacePool;
 #endif
 
