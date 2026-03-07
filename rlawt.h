@@ -46,6 +46,37 @@
 #	include <wglext.h>
 #endif
 
+#ifdef __APPLE__
+#define RLAWT_MAX_POOL 8
+
+typedef struct {
+	IOSurfaceRef surface;
+	CGFloat scale;
+	GLuint tex;
+	GLuint fbo;
+} IOSurfaceEntry;
+
+typedef struct {
+	IOSurfaceEntry entries[RLAWT_MAX_POOL];
+	int count; // entries currently allocated (0..RLAWT_MAX_POOL)
+	int back;  // current render target index
+	int front; // most recently presented surface index
+
+#ifdef RLAWT_POOL_DEBUG
+	struct {
+		int swaps;
+		int allocs;
+		int reuses;
+		int grows;
+		int stalls;
+		int failures;
+		int highWater;
+	} stats;
+	CFAbsoluteTime lastLogTime;
+#endif
+} IOSurfacePool;
+#endif
+
 typedef struct {
 	JAWT awt;
 	JAWT_DrawingSurface *ds;
@@ -53,13 +84,8 @@ typedef struct {
 
 #ifdef __APPLE__
 	CALayer *layer;
-	IOSurfaceRef buffer[2];
-	CGFloat bufferScale[2];
 	CGLContextObj context;
-
-	GLuint tex[2];
-	GLuint fbo[2];
-	int back;
+	IOSurfacePool pool;
 
 	int offsetX;
 	int offsetY;
