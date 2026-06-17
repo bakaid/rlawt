@@ -77,6 +77,11 @@ public final class AWTContext
 			os = "linux";
 			name = "librlawt.so";
 		}
+		else if (os.contains("bsd"))
+		{
+			os = "freebsd";
+			name = "librlawt.so";
+		}
 
 		String path = os + "-" + arch + "/" + name;
 		try (InputStream is = AWTContext.class.getResourceAsStream(path))
