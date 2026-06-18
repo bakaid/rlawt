@@ -96,7 +96,7 @@ jobs:
     - name: build freebsd-amd64
       uses: vmactions/freebsd-vm@v1
       with:
-        release: "15.0"
+        release: "14.3"
         usesh: true
         prepare: |
           pkg install -y openjdk11 xorg cmake
